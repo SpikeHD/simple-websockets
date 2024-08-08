@@ -91,7 +91,6 @@ enum ResponderCommand {
 pub struct ConnectionDetails {
   pub headers: HeaderMap,
   pub uri: String,
-  pub client_id: u64,
 }
 
 /// Sends outgoing messages to a websocket.
@@ -106,12 +105,13 @@ pub struct ConnectionDetails {
 #[derive(Debug, Clone)]
 pub struct Responder {
     tx: flume::Sender<ResponderCommand>,
+    client_id: u64,
     connection_details: ConnectionDetails,
 }
 
 impl Responder {
-    fn new(tx: flume::Sender<ResponderCommand>, connection_details: ConnectionDetails) -> Self {
-        Self { tx, connection_details }
+    fn new(tx: flume::Sender<ResponderCommand>, client_id: u64, connection_details: ConnectionDetails) -> Self {
+        Self { tx, client_id, connection_details }
     }
 
     /// Sends a message to the client represented by this `Responder`.
@@ -133,7 +133,7 @@ impl Responder {
 
     /// The id of the client that this `Responder` is connected to.
     pub fn client_id(&self) -> u64 {
-        self.connection_details.client_id
+        self.client_id
     }
 
     /// The connection details of the client that this `Responder` is connected to.
@@ -275,11 +275,12 @@ fn start_runtime(
 async fn handle_connection(stream: TcpStream, event_tx: flume::Sender<Event>, id: u64) {
     let mut uri = None;
     let mut headers = None;
-    let ws_stream = match accept_hdr_async(stream, |req: &tungstenite::http::Request<()>, res| {
+    let ws_stream = accept_hdr_async(stream, |req: &tungstenite::http::Request<()>, res| {
         uri = Some(req.uri().clone());
         headers = Some(req.headers().clone());
         Ok(res)
-    }).await {
+    }).await;
+    let ws_stream = match ws_stream {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -290,10 +291,9 @@ async fn handle_connection(stream: TcpStream, event_tx: flume::Sender<Event>, id
     let (resp_tx, resp_rx) = flume::unbounded();
 
     event_tx
-        .send(Event::Connect(id, Responder::new(resp_tx, ConnectionDetails {
+        .send(Event::Connect(id, Responder::new(resp_tx, id, ConnectionDetails {
             uri: uri.unwrap_or_default().to_string(),
             headers: headers.unwrap_or(HeaderMap::new()),
-            client_id: id,
         })))
         .expect("Parent thread is dead");
 
