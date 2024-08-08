@@ -44,7 +44,8 @@
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
-use tokio_tungstenite::{accept_async, tungstenite};
+use tokio_tungstenite::{accept_hdr_async, tungstenite};
+use tungstenite::http::HeaderMap;
 
 #[derive(Debug)]
 pub enum Error {
@@ -83,6 +84,16 @@ enum ResponderCommand {
     CloseConnection,
 }
 
+/// Details about a websocket connection.
+/// Includes headers and the URL that the client connected to,
+/// for using query parameters or other information in the URL.
+#[derive(Debug, Clone)]
+pub struct ConnectionDetails {
+  pub headers: HeaderMap,
+  pub uri: String,
+  pub client_id: u64,
+}
+
 /// Sends outgoing messages to a websocket.
 /// Every connected websocket client has a corresponding `Responder`.
 ///
@@ -95,12 +106,12 @@ enum ResponderCommand {
 #[derive(Debug, Clone)]
 pub struct Responder {
     tx: flume::Sender<ResponderCommand>,
-    client_id: u64,
+    connection_details: ConnectionDetails,
 }
 
 impl Responder {
-    fn new(tx: flume::Sender<ResponderCommand>, client_id: u64) -> Self {
-        Self { tx, client_id }
+    fn new(tx: flume::Sender<ResponderCommand>, connection_details: ConnectionDetails) -> Self {
+        Self { tx, connection_details }
     }
 
     /// Sends a message to the client represented by this `Responder`.
@@ -122,7 +133,12 @@ impl Responder {
 
     /// The id of the client that this `Responder` is connected to.
     pub fn client_id(&self) -> u64 {
-        self.client_id
+        self.connection_details.client_id
+    }
+
+    /// The connection details of the client that this `Responder` is connected to.
+    pub fn connection_details(&self) -> &ConnectionDetails {
+        &self.connection_details
     }
 }
 
@@ -257,7 +273,13 @@ fn start_runtime(
 }
 
 async fn handle_connection(stream: TcpStream, event_tx: flume::Sender<Event>, id: u64) {
-    let ws_stream = match accept_async(stream).await {
+    let mut uri = None;
+    let mut headers = None;
+    let ws_stream = match accept_hdr_async(stream, |req: &tungstenite::http::Request<()>, res| {
+        uri = Some(req.uri().clone());
+        headers = Some(req.headers().clone());
+        Ok(res)
+    }).await {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -268,7 +290,11 @@ async fn handle_connection(stream: TcpStream, event_tx: flume::Sender<Event>, id
     let (resp_tx, resp_rx) = flume::unbounded();
 
     event_tx
-        .send(Event::Connect(id, Responder::new(resp_tx, id)))
+        .send(Event::Connect(id, Responder::new(resp_tx, ConnectionDetails {
+            uri: uri.unwrap_or_default().to_string(),
+            headers: headers.unwrap_or(HeaderMap::new()),
+            client_id: id,
+        })))
         .expect("Parent thread is dead");
 
     // future that waits for commands from the `Responder`
