@@ -41,11 +41,16 @@
 //!     }
 //! }
 //! ```
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
-use tokio_tungstenite::{accept_hdr_async, tungstenite};
+use tokio_tungstenite::{accept_hdr_async, tungstenite, WebSocketStream};
 use tungstenite::http::HeaderMap;
+
+#[cfg(feature = "rustls")]
+use tokio_rustls::TlsAcceptor;
 
 #[derive(Debug)]
 pub enum Error {
@@ -222,6 +227,16 @@ pub fn launch(port: u16) -> Result<EventHub, Error> {
     return launch_from_listener(listener);
 }
 
+/// Start listening for websocket connections on `port` with TLS.
+/// On success, returns an [`EventHub`] for receiving messages and
+/// connection/disconnection notifications.
+#[cfg(feature = "rustls")]
+pub fn launch_tls(port: u16, acceptor: TlsAcceptor) -> Result<EventHub, Error> {
+    let address = format!("0.0.0.0:{}", port);
+    let listener = std::net::TcpListener::bind(&address).map_err(|_| Error::FailedToStart)?;
+    return launch_from_listener_tls(listener, acceptor);
+}
+
 /// Start listening for websocket connections with the specified [`TcpListener`](std::net::TcpListener).
 /// The listener must be bound (by calling [`bind`](std::net::TcpListener::bind)) before being passed to
 /// `launch_from_listener`.
@@ -242,6 +257,23 @@ pub fn launch_from_listener(listener: std::net::TcpListener) -> Result<EventHub,
         .name("Websocket listener".to_string())
         .spawn(move || {
             start_runtime(tx, listener).unwrap();
+        })
+        .map_err(|_| Error::FailedToStart)?;
+
+    Ok(EventHub::new(rx))
+}
+
+/// See [`launch_tls`]
+#[cfg(feature = "rustls")]
+pub fn launch_from_listener_tls(
+    listener: std::net::TcpListener,
+    acceptor: TlsAcceptor,
+) -> Result<EventHub, Error> {
+    let (tx, rx) = flume::unbounded();
+    std::thread::Builder::new()
+        .name("Websocket listener".to_string())
+        .spawn(move || {
+            start_runtime_tls(tx, listener, acceptor).unwrap();
         })
         .map_err(|_| Error::FailedToStart)?;
 
@@ -272,6 +304,35 @@ fn start_runtime(
         })
 }
 
+#[cfg(feature = "rustls")]
+fn start_runtime_tls(
+    event_tx: flume::Sender<Event>,
+    listener: std::net::TcpListener,
+    acceptor: TlsAcceptor,
+) -> Result<(), Error> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| Error::FailedToStart)?;
+    Runtime::new()
+        .map_err(|_| Error::FailedToStart)?
+        .block_on(async {
+            let tokio_listener = TcpListener::from_std(listener).unwrap();
+            let mut current_id: u64 = 0;
+            loop {
+                let acceptor = acceptor.clone();
+
+                match tokio_listener.accept().await {
+                    Ok((stream, _)) => {
+                        tokio::spawn(handle_connection_tls(stream, event_tx.clone(), current_id, acceptor));
+                        current_id = current_id.wrapping_add(1);
+                    }
+                    _ => {}
+                }
+            }
+        })
+}
+
+
 async fn handle_connection(stream: TcpStream, event_tx: flume::Sender<Event>, id: u64) {
     let mut uri = None;
     let mut headers = None;
@@ -284,67 +345,98 @@ async fn handle_connection(stream: TcpStream, event_tx: flume::Sender<Event>, id
         Ok(s) => s,
         Err(_) => return,
     };
-
-    let (mut outgoing, mut incoming) = ws_stream.split();
-
-    // channel for the `Responder` to send things to this websocket
-    let (resp_tx, resp_rx) = flume::unbounded();
-
-    event_tx
-        .send(Event::Connect(id, Responder::new(resp_tx, id, ConnectionDetails {
-            uri: uri.unwrap_or_default().to_string(),
-            headers: headers.unwrap_or(HeaderMap::new()),
-        })))
-        .expect("Parent thread is dead");
-
-    // future that waits for commands from the `Responder`
-    let responder_events = async move {
-        while let Ok(event) = resp_rx.recv_async().await {
-            match event {
-                ResponderCommand::Message(message) => {
-                    if let Err(_) = outgoing.send(message.into_tungstenite()).await {
-                        let _ = outgoing.close().await;
-                        return Ok(());
-                    }
-                }
-                ResponderCommand::CloseConnection => {
-                    let _ = outgoing.close().await;
-                    return Ok(());
-                }
-            }
-        }
-
-        // Disconnect if the `Responder` was dropped without explicitly disconnecting
-        let _ = outgoing.close().await;
-
-        // this future always returns Ok, so that it wont stop the try_join
-        Result::<(), ()>::Ok(())
+    let connection = ConnectionDetails {
+      uri: uri.unwrap_or_default().to_string(),
+      headers: headers.unwrap_or(HeaderMap::new()),
     };
 
-    let event_tx2 = event_tx.clone();
-    //future that forwards messages received from the websocket to the event channel
-    let events = async move {
-        while let Some(message) = incoming.next().await {
-            if let Ok(tungstenite_msg) = message {
-                if let Some(msg) = Message::from_tungstenite(tungstenite_msg) {
-                    event_tx2
-                        .send(Event::Message(id, msg))
-                        .expect("Parent thread is dead");
-                }
-            }
-        }
+    handle_websocket_stream(ws_stream, connection, event_tx, id).await;
+}
 
-        // stop the try_join once the websocket is closed and all pending incoming
-        // messages have been sent to the event channel.
-        // stopping the try_join causes responder_events to be closed too so that the
-        // `Receiver` cant send any more messages.
-        Result::<(), ()>::Err(())
+#[cfg(feature = "rustls")]
+async fn handle_connection_tls(stream: TcpStream, event_tx: flume::Sender<Event>, id: u64, acceptor: TlsAcceptor) {
+    let stream = acceptor.accept(stream).await.unwrap();
+
+    let mut uri = None;
+    let mut headers = None;
+    let ws_stream = accept_hdr_async(stream, |req: &tungstenite::http::Request<()>, res| {
+      uri = Some(req.uri().clone());
+      headers = Some(req.headers().clone());
+      Ok(res)
+    }).await;
+    let ws_stream = match ws_stream {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let connection = ConnectionDetails {
+      uri: uri.unwrap_or_default().to_string(),
+      headers: headers.unwrap_or(HeaderMap::new()),
     };
 
-    // use try_join so that when `events` returns Err (the websocket closes), responder_events will be stopped too
-    let _ = futures_util::try_join!(responder_events, events);
+    handle_websocket_stream(ws_stream, connection, event_tx, id).await;
+}
 
-    event_tx
-        .send(Event::Disconnect(id))
-        .expect("Parent thread is dead");
+async fn handle_websocket_stream<T>(ws_stream: WebSocketStream<T>, connection: ConnectionDetails, event_tx: flume::Sender<Event>, id: u64)
+where 
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+  let (mut outgoing, mut incoming) = ws_stream.split();
+
+  // channel for the `Responder` to send things to this websocket
+  let (resp_tx, resp_rx) = flume::unbounded();
+
+  event_tx
+      .send(Event::Connect(id, Responder::new(resp_tx, id, connection)))
+      .expect("Parent thread is dead");
+
+  // future that waits for commands from the `Responder`
+  let responder_events = async move {
+      while let Ok(event) = resp_rx.recv_async().await {
+          match event {
+              ResponderCommand::Message(message) => {
+                  if let Err(_) = outgoing.send(message.into_tungstenite()).await {
+                      let _ = outgoing.close().await;
+                      return Ok(());
+                  }
+              }
+              ResponderCommand::CloseConnection => {
+                  let _ = outgoing.close().await;
+                  return Ok(());
+              }
+          }
+      }
+
+      // Disconnect if the `Responder` was dropped without explicitly disconnecting
+      let _ = outgoing.close().await;
+
+      // this future always returns Ok, so that it wont stop the try_join
+      Result::<(), ()>::Ok(())
+  };
+
+  let event_tx2 = event_tx.clone();
+  //future that forwards messages received from the websocket to the event channel
+  let events = async move {
+      while let Some(message) = incoming.next().await {
+          if let Ok(tungstenite_msg) = message {
+              if let Some(msg) = Message::from_tungstenite(tungstenite_msg) {
+                  event_tx2
+                      .send(Event::Message(id, msg))
+                      .expect("Parent thread is dead");
+              }
+          }
+      }
+
+      // stop the try_join once the websocket is closed and all pending incoming
+      // messages have been sent to the event channel.
+      // stopping the try_join causes responder_events to be closed too so that the
+      // `Receiver` cant send any more messages.
+      Result::<(), ()>::Err(())
+  };
+
+  // use try_join so that when `events` returns Err (the websocket closes), responder_events will be stopped too
+  let _ = futures_util::try_join!(responder_events, events);
+
+  event_tx
+      .send(Event::Disconnect(id))
+      .expect("Parent thread is dead");
 }

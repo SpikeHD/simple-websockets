@@ -217,6 +217,79 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "rustls")]
+    #[tokio::test]
+    async fn connect_disconnect_test_tls() {
+        use std::{net::Ipv4Addr, path::PathBuf, str::FromStr, sync::Arc};
+        use tokio::net::TcpStream;
+        use tokio_rustls::{client::TlsStream, rustls::{pki_types::{pem::PemObject, CertificateDer, DnsName, ServerName}, ClientConfig, RootCertStore}, TlsConnector};
+        use tokio_tungstenite::{client_async, MaybeTlsStream, WebSocketStream};
+        use tungstenite::{handshake::client::Response, WebSocket};
+        use url::Url;
+
+        // Start a server
+        let (websocket_event_hub, server_endpoint) = start_websocket_and_get_server_endpoint_tls();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        assert!(websocket_event_hub.is_empty());
+
+        async fn connect(server_endpoint: &str) -> Result<(WebSocketStream<TlsStream<TcpStream>>, Response), Box<dyn std::error::Error>> {
+            let cert = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_cert.pem");
+
+            let mut root_store = RootCertStore::empty();
+            root_store.add_parsable_certificates(vec![CertificateDer::from_pem_file(cert)?]);
+            let config = ClientConfig::builder()
+              .with_root_certificates(root_store)
+              .with_no_client_auth();
+            let tls = TlsConnector::from(Arc::new(config));
+            let tcp_stream = TcpStream::connect(server_endpoint).await?;
+            let tls_stream = tls.connect(ServerName::DnsName(DnsName::try_from_str(server_endpoint.clone())?), tcp_stream).await?;
+            
+            let (client, response) = client_async(server_endpoint, tls_stream).await?;
+            Ok((client, response))
+        }
+        
+
+        // Connect and disconnect some clients and assert on server events
+        let (mut client_0, _response_0) =
+            connect(&server_endpoint).await.expect("Can't connect");
+        std::thread::sleep(std::time::Duration::from_millis(500)); // Ensure event is actually triggered. The longer the wait, the slower test. The short the wait the higher risk of getting an unstable test. Optimal solution would be for
+        assert_connect_event(websocket_event_hub.poll_event(), 0);
+        assert!(websocket_event_hub.is_empty());
+
+        let (mut client_1, _response_1) =
+            connect(&server_endpoint).await.expect("Can't connect");
+        let (mut _client_2, _response_2) =
+            connect(&server_endpoint).await.expect("Can't connect");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!websocket_event_hub.is_empty());
+        assert_connect_event(websocket_event_hub.poll_event(), 1);
+        assert!(!websocket_event_hub.is_empty());
+        assert_connect_event(websocket_event_hub.poll_event(), 2);
+        assert!(websocket_event_hub.is_empty());
+
+        client_1
+            .close(None)
+            .await
+            .expect("Expected no panic from close call");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!websocket_event_hub.is_empty());
+
+        assert_disconnect_event(websocket_event_hub.poll_event(), 1);
+        assert!(websocket_event_hub.is_empty());
+
+        client_0
+            .close(None)
+            .await
+            .expect("Expected no panic from close call");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!websocket_event_hub.is_empty());
+
+        assert_disconnect_event(websocket_event_hub.poll_event(), 0);
+        assert!(websocket_event_hub.is_empty());
+    }
+
     #[test]
     fn launch_bind_failed_expect_error_received_test() {
         // Occupy a random port
@@ -234,6 +307,28 @@ mod tests {
         let websocket_event_hub = simple_websockets::launch_from_listener(listener)
             .expect(format!("failed to listen on websocket port unspecified port").as_str());
         let server_endpoint = format!("ws://127.0.0.1:{port}");
+        return (websocket_event_hub, server_endpoint);
+    }
+
+    #[cfg(feature = "rustls")]
+    fn start_websocket_and_get_server_endpoint_tls() -> (simple_websockets::EventHub, String) {
+        use std::{fs::File, io::{BufRead, BufReader}, path::PathBuf, sync::Arc};
+
+        use tokio_rustls::{rustls::{pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer}, RootCertStore, ServerConfig}, TlsAcceptor};
+
+        let pkey = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_key.pem");
+        let cert = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_cert.pem");
+        let listener = TcpListener::bind(format!("0.0.0.0:0")).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![CertificateDer::from_pem_file(cert).unwrap()], PrivateKeyDer::from_pem_file(pkey).unwrap())
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let websocket_event_hub = simple_websockets::launch_from_listener_tls(listener, acceptor)
+            .expect(format!("failed to listen on websocket port unspecified port").as_str());
+        let server_endpoint = format!("wss://127.0.0.1:{port}");
         return (websocket_event_hub, server_endpoint);
     }
 
