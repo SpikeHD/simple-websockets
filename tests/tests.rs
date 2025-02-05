@@ -3,7 +3,6 @@ mod tests {
     use std::net::TcpListener;
 
     use simple_websockets;
-    use url::Url;
 
     #[test]
     fn connect_disconnect_test() {
@@ -72,17 +71,13 @@ mod tests {
         assert!(websocket_event_hub.is_empty());
 
         client_1
-            .write_message(tungstenite::Message::Text(String::from(
-                "Hello from client 1!",
-            )))
+            .send(tungstenite::Message::Text("Hello from client 1!".to_string().into()))
             .expect("Error sending text message");
         assert_text_message_event(websocket_event_hub.poll_event(), 1, "Hello from client 1!");
         assert!(websocket_event_hub.is_empty());
 
         client_1
-            .write_message(tungstenite::Message::Text(String::from(
-                "Hello from client 1 again!",
-            )))
+            .send(tungstenite::Message::Text("Hello from client 1 again!".to_string().into()))
             .expect("Error sending text message");
         assert_text_message_event(
             websocket_event_hub.poll_event(),
@@ -91,9 +86,7 @@ mod tests {
         );
 
         client_2
-            .write_message(tungstenite::Message::Text(String::from(
-                "Hello from client 2!",
-            )))
+            .send(tungstenite::Message::Text("Hello from client 2!".to_string().into()))
             .expect("Error sending text message");
         assert_text_message_event(websocket_event_hub.poll_event(), 2, "Hello from client 2!");
         assert!(websocket_event_hub.is_empty());
@@ -121,18 +114,18 @@ mod tests {
         assert!(websocket_event_hub.is_empty());
 
         client_1
-            .write_message(tungstenite::Message::Binary(vec![1, 2, 3]))
+            .send(tungstenite::Message::Binary(vec![1, 2, 3].into()))
             .expect("Error sending text message");
         assert_binary_message_event(websocket_event_hub.poll_event(), 1, vec![1, 2, 3]);
         assert!(websocket_event_hub.is_empty());
 
         client_1
-            .write_message(tungstenite::Message::Binary(vec![]))
+            .send(tungstenite::Message::Binary(vec![].into()))
             .expect("Error sending text message");
         assert_binary_message_event(websocket_event_hub.poll_event(), 1, vec![]);
 
         client_2
-            .write_message(tungstenite::Message::Binary(vec![4, 5, 6]))
+            .send(tungstenite::Message::Binary(vec![4, 5, 6].into()))
             .expect("Error sending text message");
         assert_binary_message_event(websocket_event_hub.poll_event(), 2, vec![4, 5, 6]);
         assert!(websocket_event_hub.is_empty());
@@ -165,16 +158,16 @@ mod tests {
             "Hello client 2!".to_string(),
         ));
 
-        match client_1.read_message().unwrap() {
+        match client_1.read().unwrap() {
             tungstenite::Message::Text(text) => {
-                assert_eq!("Hello client 1!", text);
+                assert_eq!(*"Hello client 1!", *text);
             }
             _ => panic!("Unexpected type!"),
         }
 
-        match client_2.read_message().unwrap() {
+        match client_2.read().unwrap() {
             tungstenite::Message::Text(text) => {
-                assert_eq!("Hello client 2!", text);
+                assert_eq!(*"Hello client 2!", *text);
             }
             _ => panic!("Unexpected type!"),
         }
@@ -203,7 +196,7 @@ mod tests {
         responder_1.send(simple_websockets::Message::Binary(vec![1, 2, 3]));
         responder_2.send(simple_websockets::Message::Binary(vec![4, 5, 6]));
 
-        match client_1.read_message().unwrap() {
+        match client_1.read().unwrap() {
             tungstenite::Message::Binary(bytes) => {
                 assert_eq!(3, bytes.len());
                 assert_eq!(1, bytes[0]);
@@ -213,7 +206,7 @@ mod tests {
             _ => panic!("Unexpected type!"),
         }
 
-        match client_2.read_message().unwrap() {
+        match client_2.read().unwrap() {
             tungstenite::Message::Binary(bytes) => {
                 assert_eq!(3, bytes.len());
                 assert_eq!(4, bytes[0]);
@@ -234,13 +227,13 @@ mod tests {
         simple_websockets::launch(taken_port).expect_err("Expected error binding to same port");
     }
 
-    fn start_websocket_and_get_server_endpoint() -> (simple_websockets::EventHub, Url) {
+    fn start_websocket_and_get_server_endpoint() -> (simple_websockets::EventHub, String) {
         let listener = TcpListener::bind(format!("0.0.0.0:0")).unwrap();
         let port = listener.local_addr().unwrap().port();
 
         let websocket_event_hub = simple_websockets::launch_from_listener(listener)
             .expect(format!("failed to listen on websocket port unspecified port").as_str());
-        let server_endpoint = Url::parse(format!("ws://127.0.0.1:{port}").as_str()).unwrap();
+        let server_endpoint = format!("ws://127.0.0.1:{port}");
         return (websocket_event_hub, server_endpoint);
     }
 
